@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BTCUSDT NUCLEAR SMC vC+ (5/8 + Bull/Bear Split)</title>
+  <style>
+    :root { --bg:#0b0c0f; --card:#111216; --accent:#00d4ff; --good:#0a8; --bad:#f44; --muted:#9aa; }
+    body{ background:var(--bg); color:#fff; font-family:Inter,system-ui,Arial; padding:20px; margin:0; }
+    .wrap{ max-width:900px; margin:0 auto; }
+    h1{ margin:0 0 8px 0; font-size:22px; font-weight:bold; }
+    p.small{ color:var(--muted); margin:6px 0 16px 0; font-size:14px; }
+    label{ font-size:13px; color:var(--muted); display:block; margin-top:12px; }
+    input{ width:100%; padding:12px; border-radius:10px; border:1px solid #222; background:var(--card); color:#fff; margin-top:6px; font-size:15px; }
+    button{ padding:12px 20px; border-radius:10px; border:none; background:var(--accent); color:#fff; cursor:pointer; margin:10px 8px 10px 0; font-weight:bold; }
+    button.stop{ background:#f44; }
+    .status{ padding:12px; background:#0d0f12; border-radius:10px; margin-top:15px; font-size:14px; }
+    .signalBox{ padding:16px; margin-top:15px; border-radius:12px; display:none; font-size:15px; line-height:1.7; }
+    .logs{ background:#000; color:#0f0; padding:12px; height:340px; overflow:auto; border-radius:10px; margin-top:15px; font-family:monospace; font-size:13px; white-space:pre-line; }
+    .infoRow{ display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-top:12px; }
+    .chip{ background:#0d0f12; padding:8px 14px; border-radius:10px; color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>BTCUSDT NUCLEAR SMC vC+</h1>
+    <p class="small">Refined SMC + Liquidity Grab | अब 5/8 पर सिग्नल | Bullish/Bearish स्प्लिट दिखेगा</p>
+
+    <label>Telegram Bot Token</label>
+    <input id="tg_token" placeholder="123456:ABC-DEF...">
+
+    <label>Chat IDs (कॉमा से अलग करें, चैनल: -100 से शुरू)</label>
+    <input id="tg_chats" placeholder="12345678,-1001234567890">
+
+    <div class="infoRow">
+      <button id="startBtn">Start Bot</button>
+      <button id="stopBtn" class="stop">Stop Bot</button>
+      <div class="chip" id="runStatus">Status: Stopped</div>
+      <div class="chip" id="lastSignal">Last Signal: —</div>
+    </div>
+
+    <div id="signal" class="signalBox"></div>
+    <div class="status" id="summary">Config: BTCUSDT • 15m/1h/4h • 1-min scan • Signal ≥5/8</div>
+    <div class="logs" id="logs"></div>
+  </div>
+
+<script>
+// ============== CONFIG ==============
+const SYMBOL = "BTCUSDT";
+const BINANCE_API_BASE = "https://api.binance.com";
+const INTERVAL_MS = 60 * 1000;
+const COOLDOWN_MS = 60 * 60 * 1000;     // 1 hour
+const MIN_CONFIRM = 5;                  // अब 5/8 पर सिग्नल
+const LOOKBACK_M15 = 200;
+const LOOKBACK_1H  = 200;
+const LOOKBACK_4H  = 120;
+const VOLUME_MULT = 2.2;
+const WICK_ATR_MULT = 1.1;
+const ATR_INCREASE_MULT = 1.15;
+const MSS_LOOKBACK = 30;
+const RR = 4;
+
+let loopId = null;
+let running = false;
+let lastSignalTime = 0;
+
+const logsEl = document.getElementById('logs');
+const statusEl = document.getElementById('runStatus');
+const lastSignalEl = document.getElementById('lastSignal');
+const signalBox = document.getElementById('signal');
+
+function log(msg){ const t=new Date().toLocaleString(); logsEl.innerText += `[\( {t}] \){msg}\n`; logsEl.scrollTop = logsEl.scrollHeight; }
+function setStatus(txt){ statusEl.innerText = 'Status: ' + txt; }
+function setLastSignal(txt){ lastSignalEl.innerText = 'Last Signal: ' + txt; }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function fmt(n,d=2){ return Number(n).toFixed(d); }
+
+// ============== Binance & Indicators (unchanged) ==============
+async function fetchBinance(intv, limit){
+  const url = `\( {BINANCE_API_BASE}/api/v3/klines?symbol= \){SYMBOL}&interval=\( {intv}&limit= \){limit}`;
+  try{ const r=await fetch(url); if(!r.ok) return []; const j=await r.json();
+    return j.map(k=>({t:k[0],o:+k[1],h:+k[2],l:+k[3],c:+k[4],v:+k[5]}));
+  }catch(e){ log('Fetch error: '+e.message); return []; }
+}
+
+function ATR(c,k=14){ if(k.length< k+1) return 0; let tr=[],a=0; for(let i=1;i<k.length;i++){ const p=k[i-1],c=k[i]; tr.push(Math.max(c.h-c.l,Math.abs(c.h-p.c),Math.abs(c.l-p.c))); } a=tr.slice(0,k).reduce((a,b)=>a+b,0)/k; for(let i=k;i<tr.length;i++) a=(a*(k-1)+tr[i])/k; return a; }
+function isVolumeSpike(c,mult=VOLUME_MULT){ if(c.length<12) return false; const last=c[c.length-1].v; const avg=c.slice(-11,-1).reduce((s,x)=>s+x.v,0)/10; return last>avg*mult; }
+function detectOB(c){ let bull=null,bear=null; for(let i=3;i<c.length-2;i++){ const p=c[i-1],x=c[i]; if(p.c<p.o&&x.c>x.o&&x.c>p.h&&x.l<=p.l) bull={p:p.l}; if(p.c>p.o&&x.c<x.o&&x.c<p.l&&x.h>=p.h) bear={p:p.h}; } return {bull,bear}; }
+function detectFVG(c){ for(let i=2;i<c.length;i++){ if(c[i-2].h < c[i].l) return 'bull'; if(c[i-2].l > c[i].h) return 'bear'; } return null; }
+function trendBiasFrom4h(h){ if(h.length<20) return 'neutral'; const last=h[h.length-1].c; const sma=h.slice(-21,-1).reduce((s,x)=>s+x.c,0)/20; return last>sma?'bull':last<sma?'bear':'neutral'; }
+function detectMSS(c){ if(c.length<MSS_LOOKBACK+5) return null; let sh=-1e9,sl=1e9; for(let i=c.length-MSS_LOOKBACK;i<c.length;i++){ if(c[i].h>sh) sh=c[i].h; if(c[i].l<sl) sl=c[i].l; } const last=c[c.length-1]; if(last.h>sh && last.c<last.o) return 'mss_bull_break'; if(last.l<sl && last.c>last.o) return 'mss_bear_break'; return null; }
+function detectLiquidityGrab(c){
+  if(c.length<20) return {top:false,bottom:false,volOk:false};
+  const atr=ATR(c,14); let sh=-1e9,sl=1e9;
+  for(let i=c.length-20;i<c.length;i++){ if(c[i].h>sh) sh=c[i].h; if(c[i].l<sl) sl=c[i].l; }
+  const last=c[c.length-1]; const volOk=isVolumeSpike(c);
+  const top = last.h>sh && (last.h-Math.max(last.o,last.c))>atr*WICK_ATR_MULT && last.c<last.o && volOk;
+  const bot = last.l<sl && (Math.min(last.o,last.c)-last.l)>atr*WICK_ATR_MULT && last.c>last.o && volOk;
+  return {top, bottom:bot, volOk};
+}
+function atrVolatilityShift(c){ const now=ATR(c,14); const avg=ATR(c.slice(0,-20),14); return now>avg*ATR_INCREASE_MULT; }
+
+// ============== Main Scan ==============
+async function scanOnce(){
+  try{
+    const [m15,h1,h4] = await Promise.all([fetchBinance('15m',200), fetchBinance('1h',200), fetchBinance('4h',120)]);
+    if(m15.length<40){ log('Not enough data'); return; }
+
+    const price = m15[m15.length-1].c;
+    const atr15 = ATR(m15,14);
+    const ob15 = detectOB(m15.slice(-80));
+    const ob1h = detectOB(h1.slice(-80));
+    const fvg = detectFVG(m15.slice(-30));
+    const volSpike = isVolumeSpike(m15);
+    const bias4h = trendBiasFrom4h(h4);
+    const atrShift = atrVolatilityShift(m15);
+    const mss = detectMSS(m15);
+    const liq = detectLiquidityGrab(m15);
+
+    // 8 Indicators
+    const ind = {
+      ob15: !!(ob15.bull||ob15.bear),
+      ob1h: !!(ob1h.bull||ob1h.bear),
+      fvg: !!fvg,
+      vol: volSpike,
+      bias: bias4h!=='neutral',
+      atr: atrShift,
+      mss: !!mss,
+      liq: (liq.top||liq.bottom)&&liq.volOk
+    };
+    const totalConfirmed = Object.values(ind).filter(Boolean).length;
+
+    // Bull / Bear Split
+    const bull = [], bear = [];
+    if(ob15.bull) bull.push("OB15Up"); if(ob15.bear) bear.push("OB15Down");
+    if(ob1h.bull) bull.push("OB1HUp"); if(ob1h.bear) bear.push("OB1HDown");
+    if(fvg==='bull') bull.push("FVGUp"); if(fvg==='bear') bear.push("FVGDown");
+    if(volSpike) bull.push("Vol");                     // strong volume = confirmation
+    if(bias4h==='bull') bull.push("BiasUp"); if(bias4h==='bear') bear.push("BiasDown");
+    if(atrShift) bull.push("ATRUp");
+    if(mss==='mss_bull_break') bull.push("MSSUp"); if(mss==='mss_bear_break') bear.push("MSSDown");
+    if(liq.bottom) bull.push("LQ-Bottom"); if(liq.top) bear.push("LQ-Top");
+
+    log(`Price \( {fmt(price)} | \){totalConfirmed}/8 | Bull:\( {bull.length} Bear: \){bear.length} | LQ:\( {liq.top?'Top':'-'} \){liq.bottom?'Bot':''}`);
+
+    if(Date.now() - lastSignalTime < COOLDOWN_MS){
+      if(totalConfirmed>=MIN_CONFIRM) log('Cooldown active');
+      return;
+    }
+
+    if(totalConfirmed >= MIN_CONFIRM){
+      let dir = 'LONG';
+      if(liq.top) dir='SHORT';
+      else if(liq.bottom) dir='LONG';
+      else if(mss?.includes('bear')) dir='SHORT';
+      else if(mss?.includes('bull')) dir='LONG';
+      else dir = bias4h==='bull'?'LONG':bias4h==='bear'?'SHORT':'LONG';
+
+      const slBuf = Math.max(atr15*1.2, price*0.001);
+      const sl = dir==='LONG'? price-slBuf : price+slBuf;
+      const tp = dir==='LONG'? price+(price-sl)*RR : price-(sl-price)*RR;
+
+      const msg = [
+        `<b>NUCLEAR SMC vC+ — ${dir}</b>`,
+        dir==='LONG' ? 'LONG' : 'SHORT',
+        ``,
+        `Entry: <b>${fmt(price)}</b>`,
+        `SL: <b>${fmt(sl)}</b>`,
+        `TP: <b>${fmt(tp)}</b>`,
+        `RR: <b>1:${RR}</b>`,
+        ``,
+        `<b>Confirmed: ${totalConfirmed}/8</b>`,
+        `Bullish: \( {bull.length} | Bearish: \){bear.length}`,
+        bull.length? `Bullish: ${bull.join(" ")}` : '',
+        bear.length? `Bearish: ${bear.join(" ")}` : '',
+        ``,
+        `Time: ${new Date().toLocaleString()}`
+      ].filter(Boolean).join('\n');
+
+      await sendToTelegram(msg);
+
+      lastSignalTime = Date.now();
+      setLastSignal(new Date().toLocaleTimeString());
+      signalBox.style.display='block';
+      signalBox.style.background = dir==='LONG'?'#0a4':'#a22';
+      signalBox.innerHTML = msg.replace(/\n/g,'<br>');
+      log(`SIGNAL → \( {dir} ( \){totalConfirmed}/8)`);
+    }
+  }catch(e){ log('Error: '+e.message); }
+}
+
+// ============== Telegram ==============
+async function sendToTelegram(msg){
+  const token = document.getElementById('tg_token').value.trim();
+  const chats = document.getElementById('tg_chats').value.trim();
+  if(!token || !chats) { log('Token/Chat missing'); return; }
+  for(const id of chats.split(',').map(s=>s.trim())){
+    const url = `https://api.telegram.org/bot\( {token}/sendMessage?chat_id= \){id}&text=${encodeURIComponent(msg)}&parse_mode=HTML&disable_web_page_preview=true`;
+    try{ const r=await fetch(url); const j=await r.json(); j.ok? log(`Sent → ${id}`):log('TG Error'); }catch(e){ log('Send failed'); }
+    await sleep(300);
+  }
+}
+
+// ============== Controls ==============
+document.getElementById('startBtn').onclick = () => {
+  if(running) return;
+  running=true; setStatus('Running'); log('Bot Started'); scanOnce();
+  loopId = setInterval(scanOnce, INTERVAL_MS);
+};
+document.getElementById('stopBtn').onclick = () => {
+  clearInterval(loopId); running=false; setStatus('Stopped'); log('Bot Stopped');
+};
+</script>
+</body>
+</html>
